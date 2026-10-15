@@ -1,0 +1,621 @@
+// ==UserScript==
+// @name         CatWar Mine Map (Shared)
+// @namespace    https://catwar.local/
+// @version      4.1
+// @description  Минное поле с локациями. Сохранение и загрузка — только по кнопкам.
+// @author       ты
+// @match        http*://*.catwar.net/*
+// @match        http*://*.catwar.su/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @license      MIT
+// ==/UserScript==
+
+(() => {
+  "use strict";
+
+  // ============================================================
+  //  НАСТРОЙКИ — URL ТВОЕГО WORKER
+  // ============================================================
+
+  const WORKER_URL = "https://shiny-star-8912.aghoulasfn.workers.dev";
+  const BIN_URL = WORKER_URL + "/map";
+
+  // ============================================================
+  //  ЛОКАЦИИ
+  // ============================================================
+
+  const LOCATIONS = [
+    "Небесная Тропа",
+    "Острые зубья",
+    "Воющая Пуща",
+    "Овечий луг",
+    "Волчий коготь",
+    "Пещера цветных камней",
+    "Подземные пещеры",
+    "Цветочный склон",
+    "Спящие ели",
+    "Обитель Матери Луны",
+    "Исток Жизни",
+    "Долина ветров",
+    "Развалины прямоходов",
+    "Мрачный отрог",
+    "Лощина потерянных"
+  ];
+
+  // ============================================================
+  //  СОСТОЯНИЯ КЛЕТОК
+  // ============================================================
+
+  const STATE_ORDER = ["empty", "green", "clear"];
+  const STATE_STYLE = {
+    empty: { bg: "rgba(220,60,60,.55)",  text: ""  },
+    green: { bg: "rgba(60,200,100,.55)", text: "✓" },
+    clear: { bg: "",                     text: ""  }
+  };
+
+  const STORAGE_USER_ID  = "catwar_mine_user_id";
+  const STORAGE_POS      = "catwar_mine_panel_pos";
+  const STORAGE_OPEN     = "catwar_mine_panel_open";
+  const STORAGE_TRANSFER = "catwar_mine_transfer";
+  const STORAGE_LOCATION = "catwar_mine_current_location";
+  const STORAGE_CACHE    = "catwar_mine_cache";
+
+  // ============================================================
+  //  СОСТОЯНИЕ
+  // ============================================================
+
+  let allMaps = { maps: {} };
+  let cells = {};
+  let currentLocation = "";
+  let panelRoot = null;
+  let tableEl = null;
+  let isOpen = true;
+  let transferToField = false;
+  let pendingPush = false;
+  let hasUnsavedChanges = false;
+
+  // ============================================================
+  //  USER ID
+  // ============================================================
+
+  function getUserId() {
+    let id = GM_getValue(STORAGE_USER_ID, "");
+    if (!id) {
+      id = "u_" + Math.random().toString(36).slice(2, 10);
+      GM_setValue(STORAGE_USER_ID, id);
+    }
+    return id;
+  }
+
+  // ============================================================
+  //  КЕШ
+  // ============================================================
+
+  function cacheLoad() {
+    try {
+      const raw = GM_getValue(STORAGE_CACHE, "");
+      if (!raw) return { maps: {} };
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      return parsed && typeof parsed === "object" ? parsed : { maps: {} };
+    } catch { return { maps: {} }; }
+  }
+
+  function cacheSave(data) {
+    try { GM_setValue(STORAGE_CACHE, JSON.stringify(data)); } catch {}
+  }
+
+  // ============================================================
+  //  СЕТЬ
+  // ============================================================
+
+  async function pullSharedMap() {
+    try {
+      const res = await fetch(`${BIN_URL}?location=${encodeURIComponent(currentLocation)}`, {
+        cache: "no-store"
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const remote = (data && data.cells) ? data.cells : {};
+      allMaps.maps[currentLocation] = remote;
+      cacheSave(allMaps);
+      cells = allMaps.maps[currentLocation] || {};
+      renderAllCells();
+      applyTransferToField();
+      markClean();
+      flashStatus("Обновлено ✓");
+    } catch (e) {
+      const cached = cacheLoad();
+      allMaps = cached;
+      cells = allMaps.maps[currentLocation] || {};
+      renderAllCells();
+      applyTransferToField();
+      flashStatus("Нет сети, локальные данные", true);
+    }
+  }
+
+  async function pushAllChanges() {
+    if (pendingPush) return;
+
+    const loc = currentLocation;
+    const cellsForLoc = allMaps.maps[loc] || {};
+    const cellCount = Object.keys(cellsForLoc).length;
+
+    // === ЗАЩИТА ОТ ПУСТОЙ ВЫГРУЗКИ ===
+    if (cellCount === 0) {
+      const answer = confirm(
+        "Локация «" + loc + "» пустая.\n\n" +
+        "Если выгрузить — у ВСЕХ пользователей эта локация очистится.\n\n" +
+        "Точно выгрузить пустоту?"
+      );
+      if (!answer) {
+        flashStatus("Выгрузка отменена", true);
+        return;
+      }
+    }
+    // ================================
+
+    pendingPush = true;
+    try {
+      const res = await fetch(BIN_URL, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          location: loc,
+          cells: cellsForLoc
+        })
+      });
+
+      if (!res.ok) throw new Error("HTTP " + res.status);
+
+      cacheSave(allMaps);
+      markClean();
+      flashStatus("Выгружено ✓");
+    } catch (e) {
+      flashStatus("Ошибка выгрузки: " + e.message, true);
+    } finally {
+      pendingPush = false;
+    }
+  }
+
+  // ============================================================
+  //  КЛЕТКИ
+  // ============================================================
+
+  function getCellKey(row, col) { return row + "-" + col; }
+
+  function getCellState(row, col) {
+    const c = cells[getCellKey(row, col)];
+    return c && c.state ? c.state : "clear";
+  }
+
+  function applyCellStyle(td, state) {
+    const st = STATE_STYLE[state] || STATE_STYLE.clear;
+    td.dataset.value = state;
+    td.style.backgroundColor = st.bg;
+    td.textContent = st.text;
+  }
+
+  function renderAllCells() {
+    if (!tableEl) return;
+    for (let i = 0; i < tableEl.rows.length; i++) {
+      for (let j = 0; j < tableEl.rows[i].cells.length; j++) {
+        const td = tableEl.rows[i].cells[j];
+        applyCellStyle(td, getCellState(i, j));
+      }
+    }
+  }
+
+  function onCellClick(row, col, td) {
+    const cur = td.dataset.value || "clear";
+    const next = STATE_ORDER[(STATE_ORDER.indexOf(cur) + 1) % STATE_ORDER.length];
+
+    applyCellStyle(td, next);
+
+    const key = getCellKey(row, col);
+    if (next === "clear") delete cells[key];
+    else cells[key] = { state: next, ts: Date.now(), by: getUserId() };
+
+    allMaps.maps[currentLocation] = cells;
+    cacheSave(allMaps);
+    markDirty();
+    applyTransferToField();
+  }
+
+  function buildTable() {
+    tableEl = document.createElement("table");
+    tableEl.id = "shared-mine-table";
+
+    const ROWS = 6, COLS = 10;
+    for (let i = 0; i < ROWS; i++) {
+      const tr = document.createElement("tr");
+      for (let j = 0; j < COLS; j++) {
+        const td = document.createElement("td");
+        td.setAttribute("tabindex", "0");
+        applyCellStyle(td, "clear");
+        td.addEventListener("click", () => onCellClick(i, j, td));
+        tr.appendChild(td);
+      }
+      tableEl.appendChild(tr);
+    }
+    return tableEl;
+  }
+
+  // ============================================================
+  //  ИНДИКАТОР ИЗМЕНЕНИЙ
+  // ============================================================
+
+  function markDirty() {
+    hasUnsavedChanges = true;
+    updateDirtyIndicator();
+  }
+
+  function markClean() {
+    hasUnsavedChanges = false;
+    updateDirtyIndicator();
+  }
+
+  function updateDirtyIndicator() {
+    if (!panelRoot) return;
+    const el = panelRoot.querySelector(".shared-mine-dirty");
+    if (!el) return;
+    if (hasUnsavedChanges) {
+      el.textContent = "● есть несохранённые изменения";
+      el.style.color = "#ffc978";
+    } else {
+      el.textContent = "";
+    }
+  }
+
+  // ============================================================
+  //  ПЕРЕНОС НА ИГРОВОЕ ПОЛЕ
+  // ============================================================
+
+  const FIELD_STYLE_ID = "shared-mine-field-style";
+
+  function ensureFieldStyle() {
+    let style = document.getElementById(FIELD_STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = FIELD_STYLE_ID;
+      document.head.appendChild(style);
+    }
+    return style;
+  }
+
+  function clearFieldColors() {
+    const style = document.getElementById(FIELD_STYLE_ID);
+    if (style) style.textContent = "";
+  }
+
+  function applyTransferToField() {
+    if (!transferToField) { clearFieldColors(); return; }
+    const cages = document.getElementById("cages");
+    if (!cages) { clearFieldColors(); return; }
+
+    let rules = "";
+    for (let i = 0; i < 6; i++) {
+      for (let j = 0; j < 10; j++) {
+        const state = getCellState(i, j);
+        if (state === "clear") continue;
+        const st = STATE_STYLE[state];
+        if (!st || !st.bg) continue;
+        const r = i + 1, c = j + 1;
+        rules += `#cages > tbody > tr:nth-of-type(${r}) > td:nth-of-type(${c})::before {` +
+                 ` content:''; position:absolute; inset:0; background:${st.bg}; pointer-events:none; z-index:0; }\n`;
+      }
+    }
+    rules += `#cages > tbody > tr > td { position: relative; }\n`;
+    ensureFieldStyle().textContent = rules;
+  }
+
+  // ============================================================
+  //  ПАНЕЛЬ
+  // ============================================================
+
+  function flashStatus(text, isError) {
+    if (!panelRoot) return;
+    const el = panelRoot.querySelector(".shared-mine-status");
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = isError ? "#ff7878" : "#78ffa1";
+    clearTimeout(el._t);
+    el._t = setTimeout(() => { el.textContent = ""; }, 2500);
+  }
+
+  function injectStyles() {
+    if (document.getElementById("shared-mine-style")) return;
+    const style = document.createElement("style");
+    style.id = "shared-mine-style";
+    style.textContent = `
+      #shared-mine-panel {
+        position: fixed; top: 40px; left: 40px; z-index: 2147483000;
+        width: 320px;
+        background: rgba(25,25,27,.95);
+        color: #e6e6e6;
+        border: 1px solid rgba(255,255,255,.18);
+        border-radius: 12px;
+        box-shadow: 0 8px 24px rgba(0,0,0,.5);
+        font: 13px/1.35 Arial, sans-serif;
+        user-select: none;
+      }
+      #shared-mine-header {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 4px 8px; cursor: grab;
+        border-radius: 11px 11px 0 0;
+        background: rgba(0,0,0,.2);
+        border-bottom: 1px solid rgba(255,255,255,.08);
+      }
+      #shared-mine-header h2 { margin: 4px 0; font-size: 14px; }
+      #shared-mine-header .arrow { font-size: 16px; opacity: .8; }
+      #shared-mine-body { padding: 8px; display: block; }
+      #shared-mine-panel.closed #shared-mine-body { display: none; }
+
+      #shared-mine-loc {
+        width: 100%;
+        background: rgba(255,255,255,.07);
+        color: #e6e6e6;
+        border: 1px solid rgba(255,255,255,.14);
+        border-radius: 7px;
+        padding: 5px 8px;
+        font: inherit; margin-bottom: 8px; outline: none;
+      }
+      #shared-mine-loc:focus { border-color: #4a9eff; }
+
+      #shared-mine-table {
+        border-collapse: collapse; table-layout: fixed;
+        width: 300px; height: 180px; margin: 0 auto;
+      }
+      #shared-mine-table td {
+        width: 30px; height: 30px;
+        border: 1px solid rgba(0,0,0,.7);
+        text-align: center; vertical-align: middle;
+        cursor: pointer; color: #000;
+        font-size: 14px; font-weight: bold;
+        padding: 0; box-sizing: border-box;
+        transition: filter .1s;
+      }
+      #shared-mine-table td:hover { filter: brightness(1.2); }
+      #shared-mine-table td:focus { outline: 2px solid #4a9eff; }
+
+      #shared-mine-tools {
+        display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;
+      }
+      #shared-mine-tools button {
+        flex: 1 1 auto;
+        background: rgba(255,255,255,.07);
+        color: inherit;
+        border: 1px solid rgba(255,255,255,.14);
+        border-radius: 7px;
+        padding: 5px 8px;
+        font: inherit; cursor: pointer;
+      }
+      #shared-mine-tools button:hover { background: rgba(255,255,255,.13); }
+
+      .shared-mine-status {
+        margin-top: 6px; font-size: 11px; text-align: center;
+        min-height: 14px; opacity: .85;
+      }
+      .shared-mine-legend {
+        display: flex; gap: 10px; margin-top: 6px; font-size: 11px; opacity: .8;
+        flex-wrap: wrap;
+      }
+      .shared-mine-legend i {
+        display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+        margin-right: 4px; vertical-align: middle;
+        border: 1px solid rgba(0,0,0,.6);
+      }
+      .shared-mine-check {
+        display: flex; align-items: center; gap: 6px;
+        margin-top: 8px; font-size: 12px; cursor: pointer;
+      }
+      .shared-mine-dirty {
+        font-size: 11px; text-align: center; margin-top: 6px; min-height: 14px;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function buildLocationSelect() {
+    const sel = document.createElement("select");
+    sel.id = "shared-mine-loc";
+    LOCATIONS.forEach((loc) => {
+      const opt = document.createElement("option");
+      opt.value = loc; opt.textContent = loc;
+      sel.appendChild(opt);
+    });
+    sel.value = currentLocation;
+    sel.addEventListener("change", () => {
+      currentLocation = sel.value;
+      GM_setValue(STORAGE_LOCATION, currentLocation);
+      cells = allMaps.maps[currentLocation] || {};
+      renderAllCells();
+      applyTransferToField();
+    });
+    return sel;
+  }
+
+  function buildPanel() {
+    injectStyles();
+
+    panelRoot = document.createElement("div");
+    panelRoot.id = "shared-mine-panel";
+
+    const header = document.createElement("div");
+    header.id = "shared-mine-header";
+    header.innerHTML = `<h2>Минное поле (общая)</h2><span class="arrow">▼</span>`;
+
+    const body = document.createElement("div");
+    body.id = "shared-mine-body";
+
+    body.appendChild(buildLocationSelect());
+    body.appendChild(buildTable());
+
+    transferToField = GM_getValue(STORAGE_TRANSFER, false) === true;
+    const transferLabel = document.createElement("label");
+    transferLabel.className = "shared-mine-check";
+    const transferInput = document.createElement("input");
+    transferInput.type = "checkbox";
+    transferInput.checked = transferToField;
+    transferInput.addEventListener("change", () => {
+      transferToField = transferInput.checked;
+      GM_setValue(STORAGE_TRANSFER, transferToField);
+      applyTransferToField();
+    });
+    transferLabel.appendChild(transferInput);
+    transferLabel.appendChild(document.createTextNode("Перенос на игровое поле"));
+    body.appendChild(transferLabel);
+
+    const tools = document.createElement("div");
+    tools.id = "shared-mine-tools";
+
+    const pullBtn = document.createElement("button");
+    pullBtn.type = "button";
+    pullBtn.textContent = "🔄 Обновить";
+    pullBtn.title = "Загрузить свежие данные с сервера. Несохранённые изменения будут потеряны.";
+    pullBtn.onclick = () => {
+      if (hasUnsavedChanges) {
+        if (!confirm("У тебя есть несохранённые изменения. Загрузить с сервера? Локальные правки будут потеряны.")) return;
+      }
+      pullSharedMap();
+    };
+
+    const pushBtn = document.createElement("button");
+    pushBtn.type = "button";
+    pushBtn.textContent = "💾 Выгрузить";
+    pushBtn.title = "Отправить все твои изменения на сервер";
+    pushBtn.onclick = () => {
+      pushAllChanges();
+    };
+
+    const clearLocalBtn = document.createElement("button");
+    clearLocalBtn.type = "button";
+    clearLocalBtn.textContent = "Очистить поле";
+    clearLocalBtn.onclick = () => {
+      if (!confirm("Очистить все отметки в локации «" + currentLocation + "»?")) return;
+      cells = {};
+      allMaps.maps[currentLocation] = cells;
+      cacheSave(allMaps);
+      markDirty();
+      renderAllCells();
+      applyTransferToField();
+    };
+
+    tools.appendChild(pullBtn);
+    tools.appendChild(pushBtn);
+    tools.appendChild(clearLocalBtn);
+    body.appendChild(tools);
+
+    const legend = document.createElement("div");
+    legend.className = "shared-mine-legend";
+    legend.innerHTML = `
+      <span><i style="background:rgba(220,60,60,.55)"></i>пусто</span>
+      <span><i style="background:rgba(60,200,100,.55)"></i>сундук</span>
+      <span><i style="background:transparent"></i>чисто</span>
+    `;
+    body.appendChild(legend);
+
+    const dirty = document.createElement("div");
+    dirty.className = "shared-mine-dirty";
+    body.appendChild(dirty);
+
+    const status = document.createElement("div");
+    status.className = "shared-mine-status";
+    body.appendChild(status);
+
+    panelRoot.appendChild(header);
+    panelRoot.appendChild(body);
+    document.body.appendChild(panelRoot);
+
+    const posX = GM_getValue(STORAGE_POS + "_x", 40);
+    const posY = GM_getValue(STORAGE_POS + "_y", 40);
+    isOpen = GM_getValue(STORAGE_OPEN, true) === true;
+    panelRoot.style.left = posX + "px";
+    panelRoot.style.top  = posY + "px";
+    if (!isOpen) {
+      panelRoot.classList.add("closed");
+      header.querySelector(".arrow").textContent = "▶";
+    }
+
+    let dragging = false, sx = 0, sy = 0, bx = 0, by = 0, moved = false;
+    header.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      dragging = true; moved = false;
+      sx = e.clientX; sy = e.clientY;
+      bx = panelRoot.offsetLeft; by = panelRoot.offsetTop;
+      e.preventDefault();
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
+      const ww = window.innerWidth, wh = window.innerHeight;
+      const pw = panelRoot.offsetWidth, ph = panelRoot.offsetHeight;
+      const nx = Math.max(0, Math.min(bx + dx, ww - pw));
+      const ny = Math.max(0, Math.min(by + dy, wh - ph));
+      panelRoot.style.left = nx + "px";
+      panelRoot.style.top  = ny + "px";
+    });
+    document.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      if (moved) {
+        GM_setValue(STORAGE_POS + "_x", panelRoot.offsetLeft);
+        GM_setValue(STORAGE_POS + "_y", panelRoot.offsetTop);
+      }
+    });
+
+    header.addEventListener("click", () => {
+      if (moved) { moved = false; return; }
+      isOpen = !isOpen;
+      panelRoot.classList.toggle("closed", !isOpen);
+      header.querySelector(".arrow").textContent = isOpen ? "▼" : "▶";
+      GM_setValue(STORAGE_OPEN, isOpen);
+    });
+  }
+
+  // ============================================================
+  //  СТАРТ
+  // ============================================================
+
+  function start() {
+    const saved = GM_getValue(STORAGE_LOCATION, "");
+    currentLocation = LOCATIONS.includes(saved) ? saved : LOCATIONS[0];
+    GM_setValue(STORAGE_LOCATION, currentLocation);
+
+    allMaps = cacheLoad();
+    cells = allMaps.maps[currentLocation] || {};
+
+    buildPanel();
+    renderAllCells();
+    applyTransferToField();
+
+    const cages = document.getElementById("cages");
+    if (cages) {
+      const mo = new MutationObserver(() => applyTransferToField());
+      mo.observe(cages, { childList: true, subtree: true });
+    } else {
+      const t = setInterval(() => {
+        const c = document.getElementById("cages");
+        if (c) {
+          clearInterval(t);
+          const mo = new MutationObserver(() => applyTransferToField());
+          mo.observe(c, { childList: true, subtree: true });
+          applyTransferToField();
+        }
+      }, 500);
+    }
+
+    if (typeof GM_registerMenuCommand === "function") {
+      GM_registerMenuCommand("Обновить карту", pullSharedMap);
+      GM_registerMenuCommand("Выгрузить изменения", pushAllChanges);
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
